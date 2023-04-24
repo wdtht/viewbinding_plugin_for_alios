@@ -2,7 +2,6 @@ import * as vscode from 'vscode'
 import * as path from 'path'
 import * as fs from 'fs'
 import * as xml2js from 'xml2js'
-import { sync as globSync } from 'glob'
 
 
 let importMappingPromise: Promise<Map<string, string>>
@@ -367,46 +366,31 @@ async function generateTsClasses(layoutXmlFile: string, flattenedViewNodeMap: Ma
 	try {
 
 		// Generate ViewBinding class.
-		const viewBindingClassName = `${classPrefix}ViewBinding`
-		const viewBindingTsContent = await generateViewBindingClass(flattenedViewNodeMap, viewBindingClassName)
-		const viewBindingTsFilePath = path.join(workspaceFolder.uri.fsPath, 'ts', 'presenter', 'viewHelper', `${viewBindingClassName}.ts`)
+		const viewBindingTsContent = await generateViewBindingClass(flattenedViewNodeMap, classPrefix)
+		const viewBindingTsFilePath = path.join(workspaceFolder.uri.fsPath, 'ts', 'presenter', 'viewHelper', `${classPrefix}ViewBinding.ts`)
 		if (!fs.existsSync(path.dirname(viewBindingTsFilePath))) {
 			fs.mkdirSync(path.dirname(viewBindingTsFilePath), { recursive: true })
 		}
 		fs.writeFileSync(viewBindingTsFilePath, viewBindingTsContent, { encoding: 'utf8', flag: 'w' })
 
-		// Generate ViewEvent class.
-		const viewEventTsContent = await generateViewEventClass(flattenedViewNodeMap, classPrefix)
-		const viewEventTsFilePath = path.join(workspaceFolder.uri.fsPath, 'ts', 'presenter', 'viewHelper', `${classPrefix}ViewEvent.ts`)
-		if (!fs.existsSync(path.dirname(viewEventTsFilePath))) {
-			fs.mkdirSync(path.dirname(viewEventTsFilePath), { recursive: true })
-		}
-		fs.writeFileSync(viewEventTsFilePath, viewEventTsContent, { encoding: 'utf8', flag: 'w' })
-
-		// Generate createXXXViewBindingAndEvent function.
-		const createViewBindingAndEventTsContent = generateCreateViewBindingAndEventFunction(classPrefix)
-		const createViewBindingAndEventFunctionName = `create${classPrefix}ViewBindingAndEvent`
-		const createViewBindingAndEventTsFilePath = path.join(workspaceFolder.uri.fsPath, 'ts', 'presenter', 'viewHelper', `${createViewBindingAndEventFunctionName}.ts`)
-		if (!fs.existsSync(path.dirname(createViewBindingAndEventTsFilePath))) {
-			fs.mkdirSync(path.dirname(createViewBindingAndEventTsFilePath), { recursive: true })
-		}
-		fs.writeFileSync(createViewBindingAndEventTsFilePath, createViewBindingAndEventTsContent, { encoding: 'utf8', flag: 'w' })
 	} catch (error) {
 		console.error('Error occurred while generating TypeScript classes:', error)
 	}
 }
 
-async function generateViewBindingClass(flatViewNodeMap: Map<string, FlattenedViewNode>, className: string): Promise<string> {
+async function generateViewBindingClass(flatViewNodeMap: Map<string, FlattenedViewNode>, classPrefix: string): Promise<string> {
 	console.log('generateViewBindingClass()')
 	let importSet = new Set<string>()
 	let imports = ''
 	let properties = ''
 	let constructorBody = ''
+	let eventHandlerBindings = ''
+	let methods = ''
 
 	const promises = new Array<Promise<void>>()
 
 	flatViewNodeMap.forEach((viewNode) => {
-		const promsie = new Promise<void>((resolve, reject) => {
+		const promise = new Promise<void>((resolve, reject) => {
 			importMappingPromise.then((importMapping) => {
 				const viewType = viewNode.clazz
 				const importString = importMapping.get(viewType)
@@ -419,28 +403,62 @@ async function generateViewBindingClass(flatViewNodeMap: Map<string, FlattenedVi
 				}
 				properties += `    public ${viewId}: ${viewType};\n`
 				constructorBody += `        this.${viewId} = rootView.findViewById('${viewId}') as ${viewType};\n`
+
+				// 定义事件处理接口
+				for (const key in eventMapping) {
+					if (Object.prototype.hasOwnProperty.call(eventMapping, key)) {
+						const events = eventMapping[key]
+						if (new RegExp(key).test(viewNode.clazz)) {
+							for (const event of events) {
+								methods += `    handle${toCamelCase(viewNode.id, true)}${toCamelCase(event.handlerName, true)}?(${event.params.map(param => `${param.name}: ${param.type}`).join(', ')}): void;\n`
+								eventHandlerBindings += `
+		if (this.eventHandler.handle${toCamelCase(viewNode.id, true)}${toCamelCase(event.handlerName, true)}) {
+			this.${viewNode.id}.on('${event.eventName}', this.eventHandler.handle${toCamelCase(viewNode.id, true)}${toCamelCase(event.handlerName, true)}.bind(this.eventHandler));
+		}`
+								for (const param of event.params) {
+									const importString = importMapping.get(param.type)
+									console.log('importString:', importString)
+									if (!importString) { continue }
+									if (!importSet.has(importString)) {
+										imports += importString
+										importSet.add(importString)
+									}
+								}
+							}
+						}
+					}
+				}
 				resolve()
 			})
 		})
-		promises.push(promsie)
+		promises.push(promise)
 	})
 
 	await Promise.all(promises)
 
 	const classContent = `
 ${imports}
-class ${className} {
-${properties}
-    constructor(rootView: CompositeView) {
-${constructorBody}
-    }
+export interface ${classPrefix}EventHandler {
+${methods}
 }
 
-export = ${className};
+export class ${classPrefix}ViewBinding {
+${properties}
+    private eventHandler: ${classPrefix}EventHandler;
+
+    constructor(rootView: CompositeView, eventHandler: ${classPrefix}EventHandler) {
+${constructorBody}
+
+		this.eventHandler = eventHandler;
+
+${eventHandlerBindings}
+    }
+}
 `
 
 	return classContent
 }
+
 
 // 预定义的事件映射表
 const eventMapping: { [key: string]: { eventName: string, handlerName: string, params: { name: string, type: string }[] }[] } = {
@@ -479,80 +497,6 @@ const eventMapping: { [key: string]: { eventName: string, handlerName: string, p
 	// 更多视图类型及其事件可以在此添加
 }
 
-async function generateViewEventClass(flattenedViewNodeMap: Map<string, FlattenedViewNode>, classNamePrefix: string): Promise<string> {
-	console.log('generateViewEventClass()')
-
-	let eventClassContent = ''
-
-	let imports = `import ${classNamePrefix}ViewBinding = require('./${classNamePrefix}ViewBinding');\n\n`
-	let importSet = new Set<string>()
-
-	const importMapping = await importMappingPromise
-
-	// 定义事件处理接口
-	let methods = ''
-	for (const view of flattenedViewNodeMap.values()) {
-		for (const key in eventMapping) {
-			if (Object.prototype.hasOwnProperty.call(eventMapping, key)) {
-				const events = eventMapping[key]
-				if (new RegExp(key).test(view.clazz)) {
-					for (const event of events) {
-						methods += `    handle${toCamelCase(view.id, true)}${toCamelCase(event.handlerName, true)}?(${event.params.map(param => `${param.name}: ${param.type}`).join(', ')}): void;\n`
-						for (const param of event.params) {
-							const importString = importMapping.get(param.type)
-							console.log('importString:', importString)
-							if (!importString) { continue }
-							if (!importSet.has(importString)) {
-								imports += importString
-								importSet.add(importString)
-							}
-						}
-					}
-				}
-			}
-
-		}
-	}
-	const interfaceString =
-		`export interface ${classNamePrefix}ViewEventHandler {
-${methods}
-}`
-	eventClassContent += imports + interfaceString + '\n\n'
-	// 定义ViewEvent类
-	eventClassContent += `export class ${classNamePrefix}ViewEvent {\n`
-	eventClassContent += `    private eventHandler: ${classNamePrefix}ViewEventHandler;\n\n`
-	eventClassContent += `    private viewBinding: ${classNamePrefix}ViewBinding;\n\n`
-
-	// 构造函数
-	eventClassContent += `    constructor(viewBinding: ${classNamePrefix}ViewBinding, eventHandler: ${classNamePrefix}ViewEventHandler) {\n`
-
-	eventClassContent += `        this.viewBinding = viewBinding;\n`
-	eventClassContent += `        this.eventHandler = eventHandler;\n`
-	eventClassContent += `        this.attachListeners();\n`
-	eventClassContent += '    }\n\n'
-
-	// 添加事件监听器方法
-	eventClassContent += '    private attachListeners(): void {\n'
-	for (const view of flattenedViewNodeMap.values()) {
-		const viewEventType = view.clazz
-		for (const key in eventMapping) {
-			if (Object.prototype.hasOwnProperty.call(eventMapping, key)) {
-				const element = eventMapping[key]
-				if (new RegExp(key).test(viewEventType)) {
-					for (const event of element) {
-						eventClassContent += `        this.viewBinding.${view.id}.on('${event.eventName}', this.eventHandler.handle${toCamelCase(view.id, true)}${toCamelCase(event.handlerName, true)}?.bind(this.eventHandler));\n`
-					}
-				}
-
-			}
-		}
-	}
-	eventClassContent += '    }\n'
-	eventClassContent += '}\n\n'
-
-	return eventClassContent
-}
-
 function toCamelCase(inputString: string, upperCaseFirstLetter: boolean = false): string {
 	// 删除非字母和数字的字符
 	const cleanedString = inputString.replace(/[^a-zA-Z0-9]+/g, " ")
@@ -571,40 +515,6 @@ function toCamelCase(inputString: string, upperCaseFirstLetter: boolean = false)
 	} else {
 		return camelCaseString.charAt(0).toLowerCase() + camelCaseString.slice(1)
 	}
-}
-
-
-/**
- * Generate a createXXXViewBindingAndEvent function based on the rootView.
- * @param rootView The root view from the parsed XML object.
- */
-function generateCreateViewBindingAndEventFunction(classPrefix: string): string {
-	console.log('generateCreateViewBindingAndEventFunction()')
-
-	const createViewBindingAndEventFunction = `
-import CompositeView = require('yunos/ui/view/CompositeView');
-import ${classPrefix}ViewBinding = require('./${classPrefix}ViewBinding');
-import { ${classPrefix}ViewEvent } from './${classPrefix}ViewEvent';
-import { ${classPrefix}ViewEventHandler } from './${classPrefix}ViewEvent';
-
-interface ${classPrefix}ViewAndEventHandler extends ${classPrefix}ViewEventHandler {
-    view: CompositeView;
-}
-
-function create${classPrefix}ViewBindingAndEvent(viewAndEventHandler: ${classPrefix}ViewAndEventHandler) {
-    const viewBinding = new ${classPrefix}ViewBinding(viewAndEventHandler.view);
-    const viewEvent = new ${classPrefix}ViewEvent(viewBinding, viewAndEventHandler);
-
-    return {
-        viewBinding,
-        viewEvent,
-    };
-}
-
-export = create${classPrefix}ViewBindingAndEvent;
-`
-
-	return createViewBindingAndEventFunction.trim()
 }
 
 
